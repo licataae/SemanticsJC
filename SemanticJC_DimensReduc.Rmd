@@ -1,0 +1,255 @@
+---
+title: "Semantics Journal Club: Dimensionality Reduction"
+author: "Abigail E. Licata"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(stats)
+library(FactoMineR)
+library(factoextra)
+library(Rtsne)
+library(tsne)
+library(ggplot2)
+library(car)
+library(plotly)
+set.seed(567)
+```
+
+## load in the data
+
+```{r }
+load(url("https://github.com/Reilly-ConceptsCognitionLab/reillylab_data/blob/main/affectvec_ordered.rda?raw=true"))
+affvec_justwords <- affectvec_ordered %>% select(word)
+affvec_justvals <- affectvec_ordered %>% select(-1) #eliminates 'word' column
+```
+
+For the PCA & visualization we're closely following the tutorial by Dr. Alboukadel Kassambara on Statistical Tools for High-throughput Data Analysis (STHDA): <http://www.sthda.com/english/articles/31-principal-component-methods-in-r-practical-guide/112-pca-principal-component-analysis-essentials/>
+
+We will compare a linear technique, principal components analysis (PCA), with a non-linear technique, t-distributed stochastic neighbor embedding (t-SNE). Let's check the heatmap of the correlation matrix to see the overall datastructure
+
+```{r }
+cor_matrix <- cor(affvec_justvals)
+heatmap(cor_matrix, symm = TRUE)
+```
+
+## PCA
+
+PCA reduces high dimensional datasets to fewer dimensions which capture the directions (or principal components) along which there is maximal variation in the data. PCA assumes directions/components which the largest variances are the most important, or principal. The amount of variance retained in each PC is measured by eigenvalues.
+
+PCA is a bit more interpretable than t-SNE (below), since the orthogonal dimensions correspond to maximum variance - however, it's captured across the entire dataset (i.e., it doesn't preserve pairwise distances like MDS which we'll use to visualize).
+
+Our data (the 176 emotion variables and the 76000+ ratings for each of them) share the same scale already, but some emotions may have greater variability (mean and/or standard deviation) across ratings and can bias PCA component estimation. We can check the variation among our variables and then decide whether or not to scale our data to avoid bias.
+
+(x(i) - mean(x))/sd(x) where mean(x) = the mean of x values & sd(x) = the standard deviation (SD).
+
+```{r }
+#mean & sd for each raw variable
+means <- apply(affvec_justvals, 2, mean)
+sds <- apply(affvec_justvals, 2, sd)
+
+mean(means) #overall mean across variables
+sd(sds)
+
+stats_df <- data.frame(
+  Mean = means,
+  SD = sds
+)
+
+head(stats_df)
+write.infile(stats_df, "raw_averages_stdevs_prePCA.csv", sep = ",")
+```
+
+We can run the PCA with FactoMineR, scaling (standardizing) the dataset directly in the PCA() function.
+
+```{r }
+
+#scaled_vals <- scale(affvec_justvals) using base R function scale() - example
+res.pca <- PCA(affvec_justvals, scale.unit = TRUE, graph = TRUE) #ncp = 5
+print(res.pca)
+```
+
+## view eigenvalues
+
+The amount of variance captured in each principal component (PC) is encoded in its eigenvalue. Generally (Kaiser, 1961), an eigenvalue \> 1 indicates that the PC accounts for more variance than what would by one of the original standardized variables (a good cut-off for keeping PCs but only in the case that the data have been scaled). Otherwise you can go with a threshold of total variance (e.g., if similar research papers select components that summarize =\> 80% of the variance, that also works...). Here, the first three components account for \> 60% of the data ("cumulative.variance.percent").
+
+```{r }
+eig.val <- get_eigenvalue(res.pca)
+eig.val
+```
+
+We can also look at the Scree plot which plots the eigenvalues from largest to smallest. It seems after the third component, the remaining eigenvalues are low and don't vary much... so we'll keep the 3 components (they explain 61.5% of the data, which is decent).
+
+```{r }
+fviz_eig(res.pca, addlabels = TRUE, ylim = c(0, 50))
+```
+
+## extract results & access different components, save to a file
+
+```{r }
+var <- get_pca_var(res.pca)
+var
+
+# coordinates (i.e., loadings * the component standard deviations)
+head(var$coord)
+# quality on the factor map/scores (cos2 = square cosine, squared coordinates var.coord^2) 
+head(var$cos2)
+# contribution values to the principal components
+head(var$contrib) #(var.cos2 * 100) / (total cos2 of the component)
+
+#dimension descriptions
+res.desc <- dimdesc(res.pca, axes = c(1,2), proba = 0.05)
+
+#save to a file
+dim_names <- c("coord", "cos2", "contrib")
+dim_labels <- paste0("_Dim", 1:3)
+df_list <- list()
+for (metric in dim_names) {
+  df_list[[metric]] <- setNames(data.frame(var[[metric]][, 1:3]), paste0(metric, dim_labels))
+}
+
+pca_var_df <- do.call(cbind, df_list) #combine by column
+pca_var_df <- cbind(Variable = rownames(var$coord), pca_var_df) #add row names
+
+write.infile(pca_var_df, "pca_variables.csv", sep = ",")
+```
+
+## correlation circle
+
+The correlation between a given variable and a PC = the coordinates of that variable on the PC. Observations are represented by their projections & variables are represented by their correlations.
+
+Below we create a variable correlation plot - it shows variable relationships by plotting positively correlated variables together and negatively correlated variables on opposing quadrants. The distance between variables and origin = quality of the variable on the factor map (i.e., the further away from the origin, the better the representation on the factor map).
+
+```{r }
+head(var$coord, 4)
+# Color by cos2 values: quality on the factor map
+#low cos2 = white, mid cos2 = blue, high cos2 = red
+#alpha.var = "cos2" allows you to change the transparency of variables
+#according to their cos2 values
+#were using select.var to select only variables with cos2 > 0.5 (0,1)
+my.cont.var <- rnorm(176) #continuous variable of length variables (in PCA)
+fviz_pca_var(res.pca, select.var = list(cos2 = 0.5),
+             col.var = "cos2",
+             alpha.var = "cos2",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"), 
+             repel = TRUE # Avoid text overlapping
+             )
+```
+
+## quality of representation (cos2)
+
+The closer a variable is to the circle of correlations, the better its representation on the factor map (\> importance). Variables that are close to the center of the plot are less important for the first components.
+
+For a given variable, the sum of the cos2 on all the principal components is equal to one (i.e., if a variable is perfectly represented by only 2 PCs, the sum of the cos2 of these two PCs = 1) and the variables are positioned on the circle of correlations... if more than two PCs are required to perfectly represent the data, we'd see the variables positioned inside of the circle of correlations.
+
+high cos2 = a good representation of the variable on the principal component (variable is close to circumference of correlation circle) low cos2 = the variable is not perfectly represented by the PCs (variable is close to the center of the circle)
+
+```{r }
+head(var$cos2, 4)
+library("corrplot")
+corrplot(var$cos2, is.corr=FALSE) #visualize vars cos2 across dimensions
+# Total cos2 of variables on Dim.1 and Dim.2
+fviz_cos2(res.pca, choice = "var", axes = 1:2, top = 50)
+```
+
+## contributions of variables to PCs
+
+= the variability in a given PC (the higher the percentage value, the more correlated the variable is with that PC & therefore the more important it is in explaining variability).
+
+we're plotting variable contributions via a correlation plot & bar plots (where the red line represents uniform contribution, i.e., equal contributions from all variables would lead to the expected value: 1/length(variables) = 1/176 = 0.0057. The expected average contribution of a variable for PC1 and PC2 is : [(176\* Eig1) + (176 \* Eig2)]/(Eig1 + Eig2).
+
+```{r }
+head(var$contrib, 4)
+corrplot(var$contrib, is.corr=FALSE) #highlight top contributors
+
+# Contributions of variables to PC1
+fviz_contrib(res.pca, choice = "var", axes = 1, top = 30)
+# Contributions of variables to PC2
+fviz_contrib(res.pca, choice = "var", axes = 2, top = 30)
+# Contributions of variables to PC3
+fviz_contrib(res.pca, choice = "var", axes = 3, top = 30)
+
+fviz_contrib(res.pca, choice = "var", axes = 1:3, top = 30) #total contribution of the 3 PCs
+
+my.cont.var <- rnorm(176) #continuous variable of length variables (in PCA)
+fviz_pca_var(res.pca, select.var = list(cos2 = 0.5),
+             col.var = my.cont.var,
+             alpha.var = "contrib",
+             gradient.cols = c("blue", "yellow", "red"),
+             legend.title = "Cont.Var")
+
+pdf("varcontributions_cos2=05.pdf")
+dev.off()
+```
+
+## plot words (individuals / rows)
+
+might be useful later / another analysis, for now it's too intense to compute.
+
+```{r }
+
+#point color & size is based on cos2 per individual
+#wordcontr <- fviz_pca_ind(res.pca, col.ind = "cos2", pointsize = "cos2",
+             #gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             #repel = TRUE # Avoid text overlapping (slow if many points)
+             #)
+
+#fviz_cos2(res.pca, choice = "ind") #bar plot of cos2 per individuals
+#fviz_contrib(res.pca, choice = "ind", axes = 1:2) # Total contribution on PC1 and PC2
+```
+
+## visualize with t-SNE
+
+t-distributed stochastic neighbor embedding (t-SNE) is an unsupervised way to achieve dimensionality reduction, but it's less interpretable than PCA so we'll mainly use it to visualize our data in 3D space.
+
+The first step in the t-SNE is by default PCA, then it uses a Gaussian kernel to compute pairwise similarity across points in high and low dimensional space, creating clusters and subclusters of data points based on optimization of probability distributions between low and high dimensional spaces. The default iteration amount is set to 1000.
+
+perplexity = an estimate of the amount of neighbors each point has (loosely, it helps t-SNE figure out how to "balance attention between local and global distributions" (Wattenberg et al., 2016)). Typically values fall between 5 & 50 but we should test a few to see how it behaves/shapes the visualization.
+
+```         
+Wattenberg, et al., "How to Use t-SNE Effectively", Distill, 2016. http://doi.org/10.23915/distill.00002
+```
+
+run the t-SNE & save output to a .csv
+
+```{r }
+
+#tsne <- tsne(affvec_justvals, initial_dims = 3, k =3)
+tsne_result <- Rtsne(affvec_justvals, dims = 3, perplexity=30, verbose=TRUE)
+
+#tsne_df <- data.frame(tsne)
+tsne_df <- data.frame(TSNE1 = tsne_result$Y[,1], TSNE2 = tsne_result$Y[,2],
+                      TSNE3 = tsne_result$Y[,3])
+
+write.infile(tsne_df, "tsne_3dims.csv", sep = ",")
+```
+
+plot it!
+
+```{r }
+#plot(tsne_result$Y, t='n', main="tSNE", xlab="dimension 1", ylab="dimension 2", "cex.main"=1, "cex.lab"=1)
+#points(tsne_result$Y, pch=19, cex=0.6)
+
+#the code below is adapted from Dr. Allen Victor @ Medium
+#https://medium.com/@victorallan/an-intuitive-guide-to-pca-in-r-a-step-by-step-tutorial-with
+#-beautiful-visualization-examples-73bce5ee02e5
+#set.seed(0)
+options(warn = -1)
+fig <-  plot_ly(data = tsne_df ,x =  ~tsne_result$Y[,1], y = ~tsne_result$Y[,2],
+                z = ~tsne_result$Y[,3]) %>% 
+  add_markers(size = 8) %>%
+  layout( 
+    xaxis = list(
+      zerolinecolor = "#ffff",
+      zerolinewidth = 2,
+      gridcolor='#ffff'), 
+    yaxis = list(
+      zerolinecolor = "#ffff",
+      zerolinewidth = 2,
+      gridcolor='#ffff'),
+    scene =list(bgcolor = "#e5ecf6"))
+fig
+```
